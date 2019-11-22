@@ -17,8 +17,10 @@ import (
 	"github.com/rancher/norman/types/convert/merge"
 	"github.com/rancher/norman/types/values"
 	"github.com/sirupsen/logrus"
+	"golang.org/x/sync/errgroup"
 	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -192,11 +194,41 @@ func (s *Store) Context() types.StorageContext {
 }
 
 func (s *Store) List(apiContext *types.APIContext, schema *types.Schema, opt *types.QueryOptions) ([]map[string]interface{}, error) {
-	namespace := getNamespace(apiContext, opt)
+	var resultList unstructured.UnstructuredList
 
-	resultList, err := s.retryList(namespace, apiContext)
-	if err != nil {
-		return nil, err
+	// if there are no namespaces field in options, a single request is made
+	if opt == nil || opt.Namespaces == nil {
+		ns := getNamespace(apiContext, opt)
+		list, err := s.retryList(ns, apiContext)
+		if err != nil {
+			return nil, err
+		}
+		resultList = *list
+	} else {
+		var (
+			errGroup errgroup.Group
+			mux      sync.Mutex
+		)
+
+		allNS := opt.Namespaces
+		for _, ns := range allNS {
+			nsCopy := ns
+			errGroup.Go(func() error {
+				list, err := s.retryList(nsCopy, apiContext)
+				if err != nil {
+					return err
+				}
+
+				mux.Lock()
+				resultList.Items = append(resultList.Items, list.Items...)
+				mux.Unlock()
+
+				return nil
+			})
+		}
+		if err := errGroup.Wait(); err != nil {
+			return nil, err
+		}
 	}
 
 	var result []map[string]interface{}
@@ -256,7 +288,7 @@ func (s *Store) realWatch(apiContext *types.APIContext, schema *types.Schema, op
 		k8sClient = watchClient.WatchClient()
 	}
 
-	timeout := int64(60 * 60)
+	timeout := int64(60 * 30)
 	req := s.common(namespace, k8sClient.Get())
 	req.VersionedParams(&metav1.ListOptions{
 		Watch:           true,
@@ -271,7 +303,7 @@ func (s *Store) realWatch(apiContext *types.APIContext, schema *types.Schema, op
 
 	framer := json.Framer.NewFrameReader(body)
 	decoder := streaming.NewDecoder(framer, &unstructuredDecoder{})
-	watcher := watch.NewStreamWatcher(restclientwatch.NewDecoder(decoder, &unstructuredDecoder{}))
+	watcher := watch.NewStreamWatcher(restclientwatch.NewDecoder(decoder, &unstructuredDecoder{}), &errorReporter{})
 
 	watchingContext, cancelWatchingContext := context.WithCancel(apiContext.Request.Context())
 	go func() {
@@ -283,12 +315,17 @@ func (s *Store) realWatch(apiContext *types.APIContext, schema *types.Schema, op
 	result := make(chan map[string]interface{})
 	go func() {
 		for event := range watcher.ResultChan() {
-			data := event.Object.(*unstructured.Unstructured)
-			s.fromInternal(apiContext, schema, data.Object)
-			if event.Type == watch.Deleted && data.Object != nil {
-				data.Object[".removed"] = true
+			if data, ok := event.Object.(*metav1.Status); ok {
+				// just logging it, keeping the same behavior as before
+				logrus.Debugf("watcher status for %s: %s", schema.ID, data.Message)
+			} else {
+				data := event.Object.(*unstructured.Unstructured)
+				s.fromInternal(apiContext, schema, data.Object)
+				if event.Type == watch.Deleted && data.Object != nil {
+					data.Object[".removed"] = true
+				}
+				result <- data.Object
 			}
-			result <- data.Object
 		}
 		logrus.Debugf("closing watcher for %s", schema.ID)
 		close(result)
@@ -299,6 +336,13 @@ func (s *Store) realWatch(apiContext *types.APIContext, schema *types.Schema, op
 }
 
 type unstructuredDecoder struct {
+}
+
+type errorReporter struct {
+}
+
+func (e *errorReporter) AsObject(err error) runtime.Object {
+	return &metav1.Status{Message: err.Error(), Code: http.StatusInternalServerError, Reason: "ClientWatchDecoding"}
 }
 
 func (d *unstructuredDecoder) Decode(data []byte, defaults *schema.GroupVersionKind, into runtime.Object) (runtime.Object, *schema.GroupVersionKind, error) {
@@ -428,12 +472,12 @@ func (s *Store) Delete(apiContext *types.APIContext, schema *types.Schema, id st
 	}
 
 	namespace, name := splitID(id)
-
-	prop := metav1.DeletePropagationBackground
+	options, err := getDeleteOption(apiContext.Request)
+	if err != nil {
+		return nil, err
+	}
 	req := s.common(namespace, k8sClient.Delete()).
-		Body(&metav1.DeleteOptions{
-			PropagationPolicy: &prop,
-		}).
+		Body(options).
 		Name(name)
 
 	err = s.doAuthed(apiContext, req).Error()
@@ -476,6 +520,18 @@ func splitID(id string) (string, string) {
 	}
 
 	return namespace, id
+}
+
+func getDeleteOption(req *http.Request) (*metav1.DeleteOptions, error) {
+	options := &metav1.DeleteOptions{}
+	if err := metainternalversion.ParameterCodec.DecodeParameters(req.URL.Query(), metainternalversion.SchemeGroupVersion, options); err != nil {
+		return nil, err
+	}
+	prop := metav1.DeletePropagationBackground
+	if options.PropagationPolicy == nil {
+		options.PropagationPolicy = &prop
+	}
+	return options, nil
 }
 
 func (s *Store) common(namespace string, req *rest.Request) *rest.Request {

@@ -1,8 +1,8 @@
 package generator
 
 import (
+	"bytes"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
@@ -12,6 +12,7 @@ import (
 	"strings"
 	"text/template"
 
+	"github.com/matryer/moq/pkg/moq"
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/types"
 	"github.com/rancher/norman/types/convert"
@@ -307,7 +308,9 @@ func GenerateControllerForTypes(version *types.APIVersion, k8sOutputPackage stri
 	baseDir := args.DefaultSourceTree()
 	k8sDir := path.Join(baseDir, k8sOutputPackage)
 
-	if err := prepareDirs(k8sDir); err != nil {
+	fakeDir := path.Join(k8sDir, "fakes")
+
+	if err := prepareDirs(k8sDir, fakeDir); err != nil {
 		return err
 	}
 
@@ -359,33 +362,45 @@ func GenerateControllerForTypes(version *types.APIVersion, k8sOutputPackage stri
 		return err
 	}
 
+	if err := generateFakes(k8sDir, controllers); err != nil {
+		return err
+	}
+
 	return gofmt(baseDir, k8sOutputPackage)
 }
 
-func Generate(schemas *types.Schemas, backendTypes map[string]bool, cattleOutputPackage, k8sOutputPackage string) error {
+func Generate(schemas *types.Schemas, privateTypes map[string]bool, cattleOutputPackage, k8sOutputPackage string) error {
 	baseDir := args.DefaultSourceTree()
 	cattleDir := path.Join(baseDir, cattleOutputPackage)
 	k8sDir := path.Join(baseDir, k8sOutputPackage)
 
-	if err := prepareDirs(cattleDir, k8sDir); err != nil {
+	if cattleOutputPackage == "" {
+		cattleDir = ""
+	}
+
+	fakeDir := path.Join(k8sDir, "fakes")
+
+	if err := prepareDirs(cattleDir, k8sDir, fakeDir); err != nil {
 		return err
 	}
 
-	controllers := []*types.Schema{}
+	var controllers []*types.Schema
 
-	cattleClientTypes := []*types.Schema{}
+	var cattleClientTypes []*types.Schema
 	for _, schema := range schemas.Schemas() {
 		if blackListTypes[schema.ID] {
 			continue
 		}
 
-		_, backendType := backendTypes[schema.ID]
+		_, privateType := privateTypes[schema.ID]
 
-		if err := generateType(cattleDir, schema, schemas); err != nil {
-			return err
+		if cattleDir != "" {
+			if err := generateType(cattleDir, schema, schemas); err != nil {
+				return err
+			}
 		}
 
-		if backendType ||
+		if privateType ||
 			(contains(schema.CollectionMethods, http.MethodGet) &&
 				!strings.HasPrefix(schema.PkgName, "k8s.io") &&
 				!strings.Contains(schema.PkgName, "/vendor/")) {
@@ -398,13 +413,15 @@ func Generate(schemas *types.Schemas, backendTypes map[string]bool, cattleOutput
 			}
 		}
 
-		if !backendType {
+		if !privateType {
 			cattleClientTypes = append(cattleClientTypes, schema)
 		}
 	}
 
-	if err := generateClient(cattleDir, cattleClientTypes); err != nil {
-		return err
+	if cattleDir != "" {
+		if err := generateClient(cattleDir, cattleClientTypes); err != nil {
+			return err
+		}
 	}
 
 	if len(controllers) > 0 {
@@ -419,17 +436,28 @@ func Generate(schemas *types.Schemas, backendTypes map[string]bool, cattleOutput
 		if err := generateScheme(false, k8sDir, &controllers[0].Version, controllers); err != nil {
 			return err
 		}
+		if err := generateFakes(k8sDir, controllers); err != nil {
+			return err
+		}
 	}
 
 	if err := gofmt(baseDir, k8sOutputPackage); err != nil {
 		return err
 	}
 
-	return gofmt(baseDir, cattleOutputPackage)
+	if cattleOutputPackage != "" {
+		return gofmt(baseDir, cattleOutputPackage)
+	}
+
+	return nil
 }
 
 func prepareDirs(dirs ...string) error {
 	for _, dir := range dirs {
+		if dir == "" {
+			continue
+		}
+
 		if err := os.MkdirAll(dir, 0755); err != nil {
 			return err
 		}
@@ -504,14 +532,6 @@ func deepCopyGen(workDir, pkg string) error {
 		})
 }
 
-type noInitGenerator struct {
-	generator.Generator
-}
-
-func (n *noInitGenerator) Init(*generator.Context, io.Writer) error {
-	return nil
-}
-
 func isObjectOrList(t *gengotypes.Type) bool {
 	for _, member := range t.Members {
 		if member.Embedded && (member.Name == "ObjectMeta" || member.Name == "ListMeta") {
@@ -523,4 +543,34 @@ func isObjectOrList(t *gengotypes.Type) bool {
 	}
 
 	return false
+}
+
+func generateFakes(k8sDir string, controllers []*types.Schema) error {
+	m, err := moq.New(k8sDir, "fakes")
+	if err != nil {
+		return err
+	}
+
+	for _, controller := range controllers {
+		var out bytes.Buffer
+
+		interfaceNames := []string{
+			controller.CodeName + "Lister",
+			controller.CodeName + "Controller",
+			controller.CodeName + "Interface",
+			controller.CodeNamePlural + "Getter",
+		}
+
+		err = m.Mock(&out, interfaceNames...)
+		if err != nil {
+			return err
+		}
+		// create the file
+		filePath := path.Join(k8sDir, "fakes", "zz_generated_"+addUnderscore(controller.ID)+"_mock.go")
+		err = ioutil.WriteFile(filePath, out.Bytes(), 0644)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }

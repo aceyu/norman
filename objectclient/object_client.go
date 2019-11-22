@@ -2,11 +2,13 @@ package objectclient
 
 import (
 	"encoding/json"
+	"net/http"
 	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/rancher/norman/restwatch"
 	"github.com/sirupsen/logrus"
+	k8sError "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -48,7 +50,7 @@ type GenericClient interface {
 	List(opts metav1.ListOptions) (runtime.Object, error)
 	Watch(opts metav1.ListOptions) (watch.Interface, error)
 	DeleteCollection(deleteOptions *metav1.DeleteOptions, listOptions metav1.ListOptions) error
-	Patch(name string, o runtime.Object, data []byte, subresources ...string) (runtime.Object, error)
+	Patch(name string, o runtime.Object, patchType types.PatchType, data []byte, subresources ...string) (runtime.Object, error)
 	ObjectFactory() ObjectFactory
 }
 
@@ -102,6 +104,13 @@ func (p *ObjectClient) Create(o runtime.Object) (runtime.Object, error) {
 		labels := obj.GetLabels()
 		if labels == nil {
 			labels = make(map[string]string)
+		} else {
+			ls := make(map[string]string)
+			for k, v := range labels {
+				ls[k] = v
+			}
+			labels = ls
+
 		}
 		labels["cattle.io/creator"] = "norman"
 		obj.SetLabels(labels)
@@ -241,7 +250,7 @@ func (p *ObjectClient) Watch(opts metav1.ListOptions) (watch.Interface, error) {
 	}
 	streamDecoder := streaming.NewDecoder(json2.Framer.NewFrameReader(r), embeddedDecoder)
 	decoder := restclientwatch.NewDecoder(streamDecoder, embeddedDecoder)
-	return watch.NewStreamWatcher(decoder), nil
+	return watch.NewStreamWatcher(decoder, k8sError.NewClientErrorReporter(http.StatusInternalServerError, "watch", "ClientWatchDecoding")), nil
 }
 
 type structuredDecoder struct {
@@ -284,7 +293,7 @@ func (p *ObjectClient) DeleteCollection(deleteOptions *metav1.DeleteOptions, lis
 		Error()
 }
 
-func (p *ObjectClient) Patch(name string, o runtime.Object, data []byte, subresources ...string) (runtime.Object, error) {
+func (p *ObjectClient) Patch(name string, o runtime.Object, patchType types.PatchType, data []byte, subresources ...string) (runtime.Object, error) {
 	ns := p.ns
 	if obj, ok := o.(metav1.Object); ok && obj.GetNamespace() != "" {
 		ns = obj.GetNamespace()
@@ -293,7 +302,7 @@ func (p *ObjectClient) Patch(name string, o runtime.Object, data []byte, subreso
 	if len(name) == 0 {
 		return result, errors.New("object missing name")
 	}
-	err := p.restClient.Patch(types.StrategicMergePatchType).
+	err := p.restClient.Patch(patchType).
 		Prefix(p.getAPIPrefix(), p.gvk.Group, p.gvk.Version).
 		NamespaceIfScoped(ns, p.resource.Namespaced).
 		Resource(p.resource.Name).
